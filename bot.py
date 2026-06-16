@@ -296,6 +296,13 @@ def edit_send_keyboard():
     ]])
 
 
+def rework_send_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📨 Отправить на проверку", callback_data="rework_send"),
+        InlineKeyboardButton("❌ Отмена", callback_data="rework_cancel"),
+    ]])
+
+
 def resolve_due(key):
     if key == "none":
         return None, None
@@ -679,21 +686,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat_id
     sender = update.effective_user.full_name if update.effective_user else "—"
 
-    # 1) Ждём ссылку на пост от Sona
+    # 1) Ждём ссылку на пост от Sona — принимаем ТОЛЬКО instagram-ссылку
     w = waiting.get(chat_id)
     if w and w["mode"] == "await_post_link":
         text = (msg.text or msg.caption or "").strip()
         urls = URL_RE.findall(text)
-        # предпочитаем инста-ссылку, иначе первую любую
         post_url = None
         for u in urls:
             if "instagr" in u.lower():
                 post_url = u
                 break
-        if not post_url and urls:
-            post_url = urls[0]
         if not post_url:
-            await msg.reply_text("Пришли ссылку на пост (Instagram).")
+            await msg.reply_text(
+                "❗️Нужна ссылка именно на пост в Instagram "
+                "(например https://www.instagram.com/p/...).\n"
+                "Пришли её, пожалуйста, ещё раз."
+            )
             return
         await handle_post_link(context, chat_id, w["task_gid"], post_url, sender)
         waiting.pop(chat_id, None)
@@ -719,6 +727,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                    reply_markup=edit_send_keyboard())
             else:
                 pm = await context.bot.send_message(chat_id, summary, reply_markup=edit_send_keyboard())
+                w["panel_msg_id"] = pm.message_id
+        except Exception:
+            pass
+        return
+
+    # 2b) СММ дорабатывает после правки (копит что изменила, опционально)
+    if w and w["mode"] == "await_rework":
+        text = msg.text or msg.caption
+        if text:
+            w.setdefault("texts", []).append(text)
+        ft = file_from_message(msg)
+        if ft:
+            w.setdefault("files", []).append(ft)
+        n = len(w.get("files", []))
+        has_text = bool(w.get("texts"))
+        summary = "🔧 Доработка: " + ", ".join(
+            ([f"текст ✚"] if has_text else []) + ([f"файлов: {n}"] if n else [])
+        ) + "\nПриложи что изменила (необязательно) и жми «Отправить на проверку»."
+        try:
+            if w.get("panel_msg_id"):
+                await context.bot.edit_message_text(summary, chat_id, w["panel_msg_id"],
+                                                   reply_markup=rework_send_keyboard())
+            else:
+                pm = await context.bot.send_message(chat_id, summary, reply_markup=rework_send_keyboard())
                 w["panel_msg_id"] = pm.message_id
         except Exception:
             pass
@@ -844,7 +876,63 @@ async def finalize_edit(context, admin_chat, w):
         block = [f"✏️ Есть правка по задаче: {t['name']}"]
         if t.get("permalink_url"):
             block.append(f"🗂 Смотри в Асане: {t['permalink_url']}")
-        await bot.send_message(smm, "\n".join(block), disable_web_page_preview=True)
+        block.append("\nКогда доработаешь — жми кнопку ниже 👇")
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Готово, на проверку", callback_data=f"ready|{task_gid}")
+        ]])
+        await bot.send_message(smm, "\n".join(block), reply_markup=kb,
+                              disable_web_page_preview=True)
+
+
+async def finalize_rework(context, smm_chat, w):
+    """СММ доработала: опц. комментарий о доработке + файлы → Under review → тебе на проверку."""
+    bot = context.bot
+    task_gid = w["task_gid"]
+    texts = w.get("texts", [])
+    files = w.get("files", [])
+    failed_files = []
+    async with httpx.AsyncClient() as client:
+        # комментарий о доработке (если есть что сказать)
+        if texts:
+            try:
+                await add_comment(client, task_gid, "🔧 Доработка от СММ:\n" + "\n".join(texts))
+            except Exception as e:
+                log.warning("Комментарий доработки: %s", e)
+        for file_id, filename in files:
+            tmp_path = None
+            try:
+                tg_file = await bot.get_file(file_id)
+                with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                    tmp_path = tmp.name
+                await tg_file.download_to_drive(tmp_path)
+                await attach_file(client, task_gid, tmp_path, filename)
+            except Exception as e:
+                log.warning("Файл доработки %s: %s", filename, e)
+                failed_files.append(filename)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        try:
+            await move_to_section(client, task_gid, SEC_REVIEW)
+            t = await get_task(client, task_gid)
+        except Exception as e:
+            await bot.send_message(smm_chat, f"⚠️ Не смог отправить на проверку: {e}")
+            return
+    msg = "✅ Отправлено заказчику на проверку."
+    if failed_files:
+        msg += f"\n⚠️ Не загрузились файлы: {len(failed_files)}."
+    await bot.send_message(smm_chat, msg)
+    # тебе на проверку
+    if ADMIN_ID:
+        site, post, _ = classify_links(URL_RE.findall(t.get("notes") or ""))
+        block = [f"👀 Доработано, на проверку: {t['name']}"]
+        if post:
+            block.append(f"📸 Пост: {post}")
+        if t.get("permalink_url"):
+            block.append(f"🗂 Асана: {t['permalink_url']}")
+        await bot.send_message(ADMIN_ID, "\n".join(block),
+                              reply_markup=review_keyboard(task_gid),
+                              disable_web_page_preview=True)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -923,6 +1011,36 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "edit_cancel":
         waiting.pop(chat_id, None)
         await query.edit_message_text("❌ Правка отменена.")
+        return
+
+    if data.startswith("ready|"):
+        # СММ нажала «Готово, на проверку» → собираем доработку
+        task_gid = data.split("|", 1)[1]
+        waiting[chat_id] = {"mode": "await_rework", "task_gid": task_gid,
+                            "texts": [], "files": [], "panel_msg_id": None}
+        await query.edit_message_text(
+            "🔧 Что доработала? Можешь приложить новый текст/фото (необязательно). "
+            "Когда готово — жми «Отправить на проверку»."
+        )
+        pm = await context.bot.send_message(
+            chat_id, "🔧 Доработка: пусто.\nПриложи изменения или сразу жми «Отправить на проверку».",
+            reply_markup=rework_send_keyboard())
+        waiting[chat_id]["panel_msg_id"] = pm.message_id
+        return
+
+    if data == "rework_send":
+        w = waiting.get(chat_id)
+        if not w or w.get("mode") != "await_rework":
+            await query.edit_message_text("⌛ Нет активной доработки.")
+            return
+        await query.edit_message_text("⏳ Отправляю на проверку…")
+        await finalize_rework(context, chat_id, w)
+        waiting.pop(chat_id, None)
+        return
+
+    if data == "rework_cancel":
+        waiting.pop(chat_id, None)
+        await query.edit_message_text("❌ Отменено. Нажми «Готово, на проверку» снова, когда будешь готова.")
         return
 
     if data.startswith("approve|"):
