@@ -3,7 +3,8 @@ import re
 import logging
 import asyncio
 import tempfile
-from datetime import date, timedelta
+from datetime import date, timedelta, time
+from zoneinfo import ZoneInfo
 
 import httpx
 from telegram import (
@@ -22,15 +23,17 @@ from telegram.ext import (
 )
 
 # ─────────────────────────────────────────────────────────────
-#  Настройки (берутся из переменных окружения на Railway)
+#  Настройки (переменные окружения на Railway)
 # ─────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ASANA_TOKEN = os.environ["ASANA_TOKEN"]
 
 ASANA_PROJECT_GID = os.environ.get("ASANA_PROJECT_GID", "1215525237226401")
-ASANA_SECTION_GID = os.environ.get("ASANA_SECTION_GID", "1215525237226403")
 ASANA_ASSIGNEE_GID = os.environ.get("ASANA_ASSIGNEE_GID", "1213398188813384")
 ASANA_WORKSPACE_GID = os.environ.get("ASANA_WORKSPACE_GID", "1208507351529750")
+
+# Секция "События для сторис" (GID уже зашит, можно переопределить переменной)
+ASANA_EVENTS_SECTION_GID = os.environ.get("ASANA_EVENTS_SECTION_GID", "1215779880131861")
 
 # Кастомное поле "Приоритет" и GID его опций
 PRIORITY_FIELD_GID = "1215525237226419"
@@ -41,11 +44,14 @@ PRIORITY_OPTIONS = {
 }
 PRIORITY_LABELS = {"high": "Высокий", "medium": "Средний", "low": "Низкий"}
 
-# Кто имеет право слать задачи (Telegram user id через запятую). Пусто = все.
+# Кто может слать события (Telegram user id через запятую). Пусто = все.
 ALLOWED_USERS = {
     int(x) for x in os.environ.get("ALLOWED_USERS", "").split(",") if x.strip()
 }
+# Chat id СММщицы для дайджеста (узнаётся по /start, впиши в Railway для надёжности)
+SMM_CHAT_ID = os.environ.get("SMM_CHAT_ID", "").strip()
 
+TZ = ZoneInfo("Asia/Bishkek")
 ASANA_API = "https://app.asana.com/api/1.0"
 URL_RE = re.compile(r"https?://[^\s]+")
 
@@ -55,10 +61,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("smm-bot")
 
-# Активные черновики (chat_id -> данные). Один черновик на чат.
-# Структура: {texts:[], files:[(file_id,filename)], sender, panel_msg_id,
-#             priority, due, seen_media_groups:set, debounce_task}
+# Активные черновики (chat_id -> данные)
 drafts: dict[int, dict] = {}
+# Запомненный chat_id СММщицы в рантайме (если не задан через переменную)
+runtime_smm_chat_id: int | None = None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -68,7 +74,7 @@ def asana_headers():
     return {"Authorization": f"Bearer {ASANA_TOKEN}"}
 
 
-async def create_asana_task(client, name, notes, priority_key, due_on):
+async def create_event_task(client, name, notes, priority_key, due_on):
     data = {
         "name": name,
         "notes": notes,
@@ -80,7 +86,6 @@ async def create_asana_task(client, name, notes, priority_key, due_on):
         data["due_on"] = due_on
     if priority_key and priority_key in PRIORITY_OPTIONS:
         data["custom_fields"] = {PRIORITY_FIELD_GID: PRIORITY_OPTIONS[priority_key]}
-
     r = await client.post(
         f"{ASANA_API}/tasks", json={"data": data}, headers=asana_headers(), timeout=30
     )
@@ -88,10 +93,12 @@ async def create_asana_task(client, name, notes, priority_key, due_on):
     return r.json()["data"]
 
 
-async def move_task_to_section(client, task_gid):
+async def move_task_to_section(client, task_gid, section_gid):
+    if not section_gid:
+        return
     try:
         await client.post(
-            f"{ASANA_API}/sections/{ASANA_SECTION_GID}/addTask",
+            f"{ASANA_API}/sections/{section_gid}/addTask",
             json={"data": {"task": task_gid}},
             headers=asana_headers(),
             timeout=30,
@@ -113,46 +120,81 @@ async def attach_file(client, task_gid, filepath, filename):
     r.raise_for_status()
 
 
+async def list_section_tasks(client, section_gid):
+    """Незавершённые задачи секции с нужными полями."""
+    params = {
+        "opt_fields": "name,due_on,completed,notes,permalink_url",
+        "completed_since": "now",  # только незавершённые
+        "limit": 100,
+    }
+    r = await client.get(
+        f"{ASANA_API}/sections/{section_gid}/tasks",
+        params=params, headers=asana_headers(), timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]
+
+
+async def complete_task(client, task_gid):
+    await client.put(
+        f"{ASANA_API}/tasks/{task_gid}",
+        json={"data": {"completed": True}},
+        headers=asana_headers(), timeout=30,
+    )
+
+
 # ─────────────────────────────────────────────────────────────
-#  Сборка названия / описания из накопленных текстов
+#  Разбор ссылок: сайт vs пост
 # ─────────────────────────────────────────────────────────────
+def classify_links(links):
+    site, post, other = None, None, []
+    for u in links:
+        low = u.lower()
+        if ("ticketon.kg" in low or "ticketon.kz" in low) and site is None:
+            site = u
+        elif ("instagram.com" in low or "instagr.am" in low) and post is None:
+            post = u
+        else:
+            other.append(u)
+    return site, post, other
+
+
 def assemble(texts):
-    """Возвращает (название, тело_без_ссылок, список_ссылок) из всех сообщений."""
     full = "\n".join(t for t in texts if t and t.strip()).strip()
     links = URL_RE.findall(full)
-    if not full:
-        return "Задача из Telegram", "", links
-
-    body_text = URL_RE.sub("", full).strip()
-    lines = body_text.split("\n")
-    title = "Задача из Telegram"
-    rest = []
-    title_taken = False
-    for l in lines:
-        if not title_taken and l.strip():
-            title = l.strip()[:120]
-            title_taken = True
-        elif title_taken:
-            rest.append(l)
-    body = "\n".join(rest).strip()
-    # уникализируем ссылки, сохраняя порядок
-    seen = set()
-    uniq_links = []
+    # уникализируем
+    seen, uniq = set(), []
     for u in links:
         if u not in seen:
             seen.add(u)
-            uniq_links.append(u)
-    return title, body, uniq_links
+            uniq.append(u)
+    if not full:
+        return "Событие", "", uniq
+    body_text = URL_RE.sub("", full).strip()
+    lines = body_text.split("\n")
+    title, rest, taken = "Событие", [], False
+    for l in lines:
+        if not taken and l.strip():
+            title = l.strip()[:120]
+            taken = True
+        elif taken:
+            rest.append(l)
+    return title, "\n".join(rest).strip(), uniq
 
 
 def build_notes(body, links, priority_key, due_label, sender):
+    site, post, other = classify_links(links)
     head = []
-    if links:
-        head.append("🔗 Ссылка: " + "  ".join(links))
+    if site:
+        head.append("🌐 Сайт: " + site)
+    if post:
+        head.append("📸 Пост: " + post)
+    for u in other:
+        head.append("🔗 Ссылка: " + u)
+    if due_label:
+        head.append("📅 Дата события: " + due_label)
     if priority_key:
         head.append("🚩 Приоритет: " + PRIORITY_LABELS[priority_key])
-    if due_label:
-        head.append("📅 Срок: " + due_label)
 
     parts = []
     if head:
@@ -169,69 +211,67 @@ def build_notes(body, links, priority_key, due_label, sender):
 # ─────────────────────────────────────────────────────────────
 def collect_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Собрать задачу", callback_data="collect")],
+        [InlineKeyboardButton("✅ Собрать событие", callback_data="collect")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
     ])
 
 
 def priority_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔴 Высокий", callback_data="p|high"),
-            InlineKeyboardButton("🟡 Средний", callback_data="p|medium"),
-            InlineKeyboardButton("🟢 Низкий", callback_data="p|low"),
-        ],
-    ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔴 Высокий", callback_data="p|high"),
+        InlineKeyboardButton("🟡 Средний", callback_data="p|medium"),
+        InlineKeyboardButton("🟢 Низкий", callback_data="p|low"),
+    ]])
 
 
-def due_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Сегодня", callback_data="d|today"),
-            InlineKeyboardButton("Завтра", callback_data="d|tomorrow"),
-        ],
-        [
-            InlineKeyboardButton("Через неделю", callback_data="d|week"),
-            InlineKeyboardButton("Без срока", callback_data="d|none"),
-        ],
-    ])
-
-
-def resolve_due(key):
+def date_keyboard():
     today = date.today()
-    if key == "today":
-        d = today
-    elif key == "tomorrow":
-        d = today + timedelta(days=1)
-    elif key == "week":
-        d = today + timedelta(days=7)
-    else:
-        return None, None
-    return d.isoformat(), d.strftime("%d.%m.%Y")
+    rows, row = [], []
+    # ближайшие 7 дней + неделя/2 недели
+    labels = []
+    for i in range(0, 7):
+        d = today + timedelta(days=i)
+        name = {0: "Сегодня", 1: "Завтра"}.get(i, d.strftime("%d.%m"))
+        labels.append((name, d.isoformat()))
+    labels.append(("+2 недели", (today + timedelta(days=14)).isoformat()))
+    labels.append(("+месяц", (today + timedelta(days=30)).isoformat()))
+    for name, iso in labels:
+        row.append(InlineKeyboardButton(name, callback_data=f"d|{iso}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✍️ Ввести дату вручную", callback_data="d|manual")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ─────────────────────────────────────────────────────────────
-#  Панель-черновик: показать / обновить сводку накопленного
+#  Панель-черновик
 # ─────────────────────────────────────────────────────────────
 def draft_summary(draft):
     title, body, links = assemble(draft["texts"])
+    site, post, other = classify_links(links)
     n_files = len(draft["files"])
-    lines = [f"📝 Черновик: «{title}»"]
+    lines = [f"📝 Черновик события: «{title}»"]
     extras = []
     if body:
         extras.append("текст ✚")
-    if links:
-        extras.append(f"ссылок: {len(links)}")
+    if site:
+        extras.append("сайт ✓")
+    if post:
+        extras.append("пост ✓")
+    if other:
+        extras.append(f"ещё ссылок: {len(other)}")
     if n_files:
         extras.append(f"вложений: {n_files}")
     if extras:
         lines.append("Собрано: " + ", ".join(extras))
-    lines.append("\nКидай ещё или жми «Собрать задачу», когда всё.")
+    lines.append("\nКидай ещё или жми «Собрать событие».")
     return "\n".join(lines)
 
 
 async def refresh_panel(context, chat_id):
-    """Обновляет (или создаёт) сообщение-панель с кнопками."""
     draft = drafts.get(chat_id)
     if not draft:
         return
@@ -239,19 +279,15 @@ async def refresh_panel(context, chat_id):
     if draft.get("panel_msg_id"):
         try:
             await context.bot.edit_message_text(
-                text, chat_id, draft["panel_msg_id"],
-                reply_markup=collect_keyboard(),
+                text, chat_id, draft["panel_msg_id"], reply_markup=collect_keyboard()
             )
             return
         except Exception:
-            pass  # сообщение могло устареть — пересоздадим ниже
-    msg = await context.bot.send_message(
-        chat_id, text, reply_markup=collect_keyboard()
-    )
+            pass
+    msg = await context.bot.send_message(chat_id, text, reply_markup=collect_keyboard())
     draft["panel_msg_id"] = msg.message_id
 
 
-# Дебаунс: при пачке сообщений (особенно альбомов) обновляем панель один раз.
 async def schedule_refresh(context, chat_id):
     draft = drafts.get(chat_id)
     if not draft:
@@ -271,15 +307,18 @@ async def schedule_refresh(context, chat_id):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Финальное создание задачи
+#  Финальное создание события
 # ─────────────────────────────────────────────────────────────
-async def finalize_task(context, chat_id):
+async def finalize_event(context, chat_id):
     draft = drafts.get(chat_id)
     if not draft:
         return
     bot = context.bot
     priority_key = draft.get("priority")
-    due_iso, due_label = resolve_due(draft["due"]) if draft.get("due") else (None, None)
+    due_iso = draft.get("due_iso")
+    due_label = None
+    if due_iso:
+        due_label = date.fromisoformat(due_iso).strftime("%d.%m.%Y")
 
     title, body, links = assemble(draft["texts"])
     notes = build_notes(body, links, priority_key, due_label, draft["sender"])
@@ -287,12 +326,12 @@ async def finalize_task(context, chat_id):
 
     async with httpx.AsyncClient() as client:
         try:
-            task = await create_asana_task(client, title, notes, priority_key, due_iso)
+            task = await create_event_task(client, title, notes, priority_key, due_iso)
             task_gid = task["gid"]
-            await move_task_to_section(client, task_gid)
+            await move_task_to_section(client, task_gid, ASANA_EVENTS_SECTION_GID)
         except Exception as e:
-            log.exception("Ошибка создания задачи")
-            await bot.edit_message_text(f"❌ Не смог создать задачу:\n{e}", chat_id, panel_id)
+            log.exception("Ошибка создания события")
+            await bot.edit_message_text(f"❌ Не смог создать событие:\n{e}", chat_id, panel_id)
             drafts.pop(chat_id, None)
             return
 
@@ -310,17 +349,95 @@ async def finalize_task(context, chat_id):
                 log.warning("Не прикрепил файл %s: %s", filename, e)
 
     permalink = task.get("permalink_url", "")
-    out = [f"✅ Задача создана: {title}"]
-    if priority_key:
-        out.append(f"🚩 {PRIORITY_LABELS[priority_key]}")
+    out = [f"✅ Событие создано: {title}"]
     if due_label:
         out.append(f"📅 {due_label}")
+    if priority_key:
+        out.append(f"🚩 {PRIORITY_LABELS[priority_key]}")
     if attached:
         out.append(f"📎 Вложений: {attached}")
     if permalink:
         out.append(permalink)
     await bot.edit_message_text("\n".join(out), chat_id, panel_id)
     drafts.pop(chat_id, None)
+
+
+# ─────────────────────────────────────────────────────────────
+#  Ежедневный дайджест + автоархив
+# ─────────────────────────────────────────────────────────────
+def smm_chat_id():
+    if SMM_CHAT_ID:
+        return int(SMM_CHAT_ID)
+    return runtime_smm_chat_id
+
+
+async def build_and_send_digest(context: ContextTypes.DEFAULT_TYPE, target_chat=None):
+    chat = target_chat or smm_chat_id()
+    if not chat:
+        log.warning("Дайджест: не задан chat_id СММщицы (SMM_CHAT_ID или /start).")
+        return "no_recipient"
+    if not ASANA_EVENTS_SECTION_GID:
+        log.warning("Дайджест: не задан ASANA_EVENTS_SECTION_GID.")
+        if target_chat:
+            await context.bot.send_message(chat, "⚠️ Не настроена секция событий (ASANA_EVENTS_SECTION_GID).")
+        return "no_section"
+
+    today = date.today()
+    async with httpx.AsyncClient() as client:
+        try:
+            tasks = await list_section_tasks(client, ASANA_EVENTS_SECTION_GID)
+        except Exception as e:
+            log.exception("Дайджест: ошибка чтения секции")
+            if target_chat:
+                await context.bot.send_message(chat, f"⚠️ Ошибка чтения Асаны: {e}")
+            return "error"
+
+        active, archived = [], 0
+        for t in tasks:
+            due = t.get("due_on")
+            if due:
+                d = date.fromisoformat(due)
+                if d < today:
+                    # прошло — архивируем (помечаем выполненным)
+                    try:
+                        await complete_task(client, t["gid"])
+                        archived += 1
+                    except Exception as e:
+                        log.warning("Не заархивировал %s: %s", t["gid"], e)
+                    continue
+            active.append(t)
+
+    # сортируем по дате (без даты — в конец)
+    active.sort(key=lambda t: t.get("due_on") or "9999-12-31")
+
+    if not active:
+        text = "📭 На сегодня активных событий для сторис нет."
+        await context.bot.send_message(chat, text)
+        return "empty"
+
+    lines = [f"📅 События для сторис на {today.strftime('%d.%m.%Y')}:\n"]
+    for t in active:
+        due = t.get("due_on")
+        when = date.fromisoformat(due).strftime("%d.%m") if due else "—"
+        block = [f"• {t['name']} ({when})"]
+        site, post, _ = classify_links(URL_RE.findall(t.get("notes") or ""))
+        if site:
+            block.append(f"  🌐 {site}")
+        if post:
+            block.append(f"  📸 {post}")
+        lines.append("\n".join(block))
+    if archived:
+        lines.append(f"\n🗂 Заархивировано прошедших: {archived}")
+
+    # Telegram лимит ~4096 символов — режем при необходимости
+    full = "\n".join(lines)
+    for chunk_start in range(0, len(full), 3900):
+        await context.bot.send_message(chat, full[chunk_start:chunk_start + 3900])
+    return "ok"
+
+
+async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE):
+    await build_and_send_digest(context)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -333,16 +450,25 @@ def authorized(update: Update) -> bool:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global runtime_smm_chat_id
     uid = update.effective_user.id if update.effective_user else "?"
+    chat_id = update.effective_chat.id
+    # Любой, кто не входит в ALLOWED_USERS, считается потенциальным получателем
+    # дайджеста (т.е. СММщица). Если список пуст — не назначаем автоматически.
+    note = ""
+    if ALLOWED_USERS and uid not in ALLOWED_USERS and runtime_smm_chat_id is None:
+        runtime_smm_chat_id = chat_id
+        note = "\n\n✅ Ты зарегистрирована как получатель ежедневного дайджеста в 10:00."
     await update.message.reply_text(
-        "Привет! Кидай материал для задачи — можно несколькими сообщениями подряд "
-        "(текст, фото, видео, ссылки, в т.ч. пересланные).\n\n"
-        "Бот копит всё в один черновик. Когда всё скинул — жми «✅ Собрать задачу», "
-        "выбери приоритет и срок.\n\n"
-        "• Первая строка текста — название задачи\n"
-        "• Ссылки соберу отдельным блоком сверху\n"
-        "• /cancel — сбросить текущий черновик\n\n"
-        f"Твой Telegram ID: {uid}"
+        "Привет! Кидай материал для события — можно несколькими сообщениями подряд "
+        "(текст, афиша, ссылки на сайт и пост, в т.ч. пересланные).\n\n"
+        "Бот копит всё в один черновик. Когда всё скинул — жми «✅ Собрать событие», "
+        "выбери приоритет и дату.\n\n"
+        "• Первая строка текста — название события\n"
+        "• Ссылку ticketon → сайт, instagram → пост (бот сам разложит)\n"
+        "• /digest — прислать дайджест прямо сейчас\n"
+        "• /cancel — сбросить черновик\n\n"
+        f"Твой Telegram ID / chat_id: {uid} / {chat_id}" + note
     )
 
 
@@ -351,6 +477,20 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🗑 Черновик сброшен.")
     else:
         await update.message.reply_text("Нет активного черновика.")
+
+
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await build_and_send_digest(context, target_chat=update.effective_chat.id)
+
+
+async def cmd_setsmm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Назначить текущий чат получателем дайджеста (для самой СММщицы)."""
+    global runtime_smm_chat_id
+    runtime_smm_chat_id = update.effective_chat.id
+    await update.message.reply_text(
+        f"✅ Этот чат назначен получателем дайджеста. chat_id: {runtime_smm_chat_id}\n"
+        "Впиши его в Railway → SMM_CHAT_ID, чтобы сохранилось после рестарта."
+    )
 
 
 def file_from_message(msg):
@@ -367,49 +507,62 @@ def file_from_message(msg):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
-        await update.message.reply_text("⛔ Нет доступа.")
+        await update.message.reply_text("⛔ Нет доступа к созданию событий.")
         return
 
     msg = update.message
     chat_id = msg.chat_id
     sender = update.effective_user.full_name if update.effective_user else "—"
 
-    # Создаём черновик, если его ещё нет
     draft = drafts.get(chat_id)
     if not draft:
         draft = {
-            "texts": [],
-            "files": [],
-            "sender": sender,
-            "panel_msg_id": None,
-            "priority": None,
-            "due": None,
-            "seen_media_groups": set(),
-            "debounce_task": None,
+            "texts": [], "files": [], "sender": sender,
+            "panel_msg_id": None, "priority": None,
+            "due_iso": None, "debounce_task": None,
             "stage": "collecting",
         }
         drafts[chat_id] = draft
 
-    # Если черновик уже на этапе выбора приоритета/срока — не примешиваем новые
+    # Ручной ввод даты ожидается отдельно
+    if draft.get("stage") == "await_manual_date":
+        text = (msg.text or "").strip()
+        iso = parse_manual_date(text)
+        if not iso:
+            await msg.reply_text("Не понял дату. Формат: ДД.ММ.ГГГГ (напр. 25.08.2026).")
+            return
+        draft["due_iso"] = iso
+        await msg.reply_text("⏳ Создаю событие…")
+        await finalize_event(context, chat_id)
+        return
+
     if draft.get("stage") != "collecting":
         await msg.reply_text(
-            "⏳ Этот черновик уже собирается (выбери приоритет/срок выше). "
-            "Для новой задачи заверши текущую или /cancel."
+            "⏳ Это событие уже собирается (выбери приоритет/дату выше). "
+            "Для нового заверши текущее или /cancel."
         )
         return
 
-    # Текст / подпись
     text = msg.text or msg.caption
     if text:
         draft["texts"].append(text)
-
-    # Файл
     file_tuple = file_from_message(msg)
     if file_tuple:
         draft["files"].append(file_tuple)
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
     await schedule_refresh(context, chat_id)
+
+
+def parse_manual_date(text):
+    text = text.strip()
+    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            from datetime import datetime
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -430,38 +583,61 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "collect":
         if not draft["texts"] and not draft["files"]:
-            await query.answer("Черновик пуст — кинь хоть что-то", show_alert=True)
+            await query.answer("Черновик пуст", show_alert=True)
             return
         draft["stage"] = "priority"
         title, _, _ = assemble(draft["texts"])
         await query.edit_message_text(
-            f"📝 «{title}»\n\nВыбери приоритет:",
-            reply_markup=priority_keyboard(),
+            f"📝 «{title}»\n\nВыбери приоритет:", reply_markup=priority_keyboard()
         )
         return
 
     if data.startswith("p|"):
         draft["priority"] = data.split("|")[1]
-        draft["stage"] = "due"
+        draft["stage"] = "date"
         title, _, _ = assemble(draft["texts"])
         await query.edit_message_text(
-            f"📝 «{title}»\n🚩 Приоритет: {PRIORITY_LABELS[draft['priority']]}\n\nТеперь срок:",
-            reply_markup=due_keyboard(),
+            f"📝 «{title}»\n🚩 {PRIORITY_LABELS[draft['priority']]}\n\nДата события:",
+            reply_markup=date_keyboard(),
         )
         return
 
     if data.startswith("d|"):
-        draft["due"] = data.split("|")[1]
+        val = data.split("|", 1)[1]
+        if val == "manual":
+            draft["stage"] = "await_manual_date"
+            await query.edit_message_text(
+                "✍️ Напиши дату события сообщением в формате ДД.ММ.ГГГГ (напр. 25.08.2026)."
+            )
+            return
+        draft["due_iso"] = val
         title, _, _ = assemble(draft["texts"])
-        await query.edit_message_text(f"📝 «{title}»\n⏳ Создаю задачу…")
-        await finalize_task(context, chat_id)
+        await query.edit_message_text(f"📝 «{title}»\n⏳ Создаю событие…")
+        await finalize_event(context, chat_id)
         return
 
 
+async def on_startup(app: Application):
+    # Ежедневный дайджест в 10:00 по Бишкеку
+    app.job_queue.run_daily(
+        daily_digest_job,
+        time=time(hour=10, minute=0, tzinfo=TZ),
+        name="daily_digest",
+    )
+    log.info("Дайджест запланирован на 10:00 Asia/Bishkek")
+
+
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(on_startup)
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("digest", cmd_digest))
+    app.add_handler(CommandHandler("setsmm", cmd_setsmm))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(
         MessageHandler(
