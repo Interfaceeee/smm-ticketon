@@ -4,6 +4,7 @@ import logging
 import asyncio
 import tempfile
 import functools
+import mimetypes
 from datetime import date, timedelta, time, datetime
 from zoneinfo import ZoneInfo
 
@@ -113,16 +114,6 @@ async def add_comment(client, task_gid, text):
                      json={"data": {"text": text}}, headers=asana_headers(), timeout=30)
 
 
-async def add_comment_with_attachment(client, task_gid, filepath, filename):
-    """Прикрепляет файл к задаче (появляется как вложение/в активности)."""
-    with open(filepath, "rb") as f:
-        files = {"file": (filename, f)}
-        r = await client.post(f"{ASANA_API}/tasks/{task_gid}/attachments",
-                             data={"parent": task_gid}, files=files,
-                             headers=asana_headers(), timeout=120)
-    r.raise_for_status()
-
-
 async def list_section_tasks(client, section_gid):
     params = {"opt_fields": "name,due_on,completed,notes,permalink_url",
               "completed_since": "now", "limit": 100}
@@ -140,9 +131,17 @@ async def list_attachments(client, task_gid):
     return r.json()["data"]
 
 
+def guess_mime(filename):
+    mime, _ = mimetypes.guess_type(filename)
+    return mime or "application/octet-stream"
+
+
 async def attach_file(client, task_gid, filepath, filename):
+    """Прикрепляет файл к задаче. Явно указываем MIME-type — иначе Asana
+    отвечает 400 на загрузку фото без content-type."""
+    mime = guess_mime(filename)
     with open(filepath, "rb") as f:
-        files = {"file": (filename, f)}
+        files = {"file": (filename, f, mime)}
         r = await client.post(f"{ASANA_API}/tasks/{task_gid}/attachments",
                              data={"parent": task_gid}, files=files,
                              headers=asana_headers(), timeout=120)
@@ -560,42 +559,52 @@ async def build_and_send_digest(context, target_chat=None):
     if not chat:
         log.warning("Дайджест: нет получателя")
         return
-    today = date.today()
     async with httpx.AsyncClient() as client:
         try:
-            tasks = []
-            for sec in (SEC_INBOX, SEC_IN_PROGRESS, SEC_REVIEW):
-                tasks += await list_section_tasks(client, sec)
+            tagged = []  # (task, section_code)
+            for sec, code in ((SEC_INBOX, "inbox"), (SEC_IN_PROGRESS, "progress"), (SEC_REVIEW, "review")):
+                for t in await list_section_tasks(client, sec):
+                    tagged.append((t, code))
         except Exception as e:
             log.exception("Дайджест чтение")
             if target_chat:
                 await context.bot.send_message(chat, f"⚠️ Ошибка Асаны: {e}")
             return
 
-    # уникализируем по gid
+    # уникализируем по gid (первая встреченная секция приоритетна: inbox→progress→review)
     seen, uniq = set(), []
-    for t in tasks:
+    for t, code in tagged:
         if t["gid"] not in seen:
-            seen.add(t["gid"]); uniq.append(t)
-    uniq.sort(key=lambda t: t.get("due_on") or "9999-12-31")
+            seen.add(t["gid"]); uniq.append((t, code))
+    uniq.sort(key=lambda x: x[0].get("due_on") or "9999-12-31")
 
     if not uniq:
         await context.bot.send_message(chat, "📭 Активных задач нет.")
         return
 
     await context.bot.send_message(chat, f"📋 Активные задачи — {len(uniq)} шт.")
-    for t in uniq:
+    status_label = {"inbox": "🆕 Новая", "progress": "🔄 В работе", "review": "⏳ На проверке"}
+    for t, code in uniq:
         due = t.get("due_on")
         when = date.fromisoformat(due).strftime("%d.%m.%Y") if due else "без даты"
-        block = [f"📌 {t['name']}", f"📅 {when}"]
+        block = [f"📌 {t['name']}", f"{status_label.get(code, '')}  📅 {when}"]
         site, post, _ = classify_links(URL_RE.findall(t.get("notes") or ""))
         if site: block.append(f"🌐 Сайт: {site}")
         if post: block.append(f"📸 Пост: {post}")
         if t.get("permalink_url"): block.append(f"🗂 Асана: {t['permalink_url']}")
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📎 Прислать файлы", callback_data=f"files|{t['gid']}")
-        ]])
-        await context.bot.send_message(chat, "\n".join(block), reply_markup=kb,
+
+        gid = t["gid"]
+        files_btn = InlineKeyboardButton("📎 Файлы", callback_data=f"files|{gid}")
+        if code == "inbox":
+            rows = [[InlineKeyboardButton("🤝 Взять в работу", callback_data=f"take|{gid}")],
+                    [files_btn]]
+        elif code == "progress":
+            rows = [[InlineKeyboardButton("✅ Отправить ссылку на пост", callback_data=f"link|{gid}")],
+                    [files_btn]]
+        else:  # review
+            rows = [[files_btn]]
+        await context.bot.send_message(chat, "\n".join(block),
+                                      reply_markup=InlineKeyboardMarkup(rows),
                                       disable_web_page_preview=True)
 
 
@@ -797,22 +806,39 @@ async def finalize_edit(context, admin_chat, w):
     texts = w.get("texts", [])
     files = w.get("files", [])
     comment = "✏️ Правка от заказчика:\n" + ("\n".join(texts) if texts else "(см. вложения)")
+    failed_files = []
     async with httpx.AsyncClient() as client:
         try:
             await add_comment(client, task_gid, comment)
-            for file_id, filename in files:
+        except Exception as e:
+            await bot.send_message(admin_chat, f"⚠️ Не смог отправить правку: {e}")
+            return
+        # вложения — каждое в своём try, чтобы одно битое не валило всё
+        for file_id, filename in files:
+            tmp_path = None
+            try:
                 tg_file = await bot.get_file(file_id)
                 with tempfile.NamedTemporaryFile(delete=False) as tmp:
                     tmp_path = tmp.name
                 await tg_file.download_to_drive(tmp_path)
                 await attach_file(client, task_gid, tmp_path, filename)
-                os.unlink(tmp_path)
+            except Exception as e:
+                log.warning("Вложение правки %s: %s", filename, e)
+                failed_files.append(filename)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        try:
             await move_to_section(client, task_gid, SEC_IN_PROGRESS)
             t = await get_task(client, task_gid)
         except Exception as e:
-            await bot.send_message(admin_chat, f"⚠️ Не смог отправить правку: {e}")
+            await bot.send_message(admin_chat, f"⚠️ Правка добавлена, но статус не обновился: {e}")
             return
-    await bot.send_message(admin_chat, "📨 Правка отправлена СММ.")
+
+    msg = "📨 Правка отправлена СММ."
+    if failed_files:
+        msg += f"\n⚠️ Не загрузились файлы: {len(failed_files)} (текст правки ушёл)."
+    await bot.send_message(admin_chat, msg)
     smm = smm_chat_id()
     if smm:
         block = [f"✏️ Есть правка по задаче: {t['name']}"]
@@ -852,6 +878,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         waiting[chat_id] = {"mode": "await_post_link", "task_gid": task_gid}
         if ADMIN_ID:
             await context.bot.send_message(ADMIN_ID, f"🤝 СММ взял(а) в работу: {t['name']}")
+        return
+
+    if data.startswith("link|"):
+        task_gid = data.split("|", 1)[1]
+        async with httpx.AsyncClient() as client:
+            try:
+                t = await get_task(client, task_gid)
+            except Exception as e:
+                await query.answer(f"Ошибка: {e}", show_alert=True)
+                return
+        waiting[chat_id] = {"mode": "await_post_link", "task_gid": task_gid}
+        await context.bot.send_message(
+            chat_id,
+            f"🔗 Пришли ссылку на пост (Instagram) для задачи:\n📌 {t['name']}"
+        )
         return
 
     if data.startswith("edit|"):
