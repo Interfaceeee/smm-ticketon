@@ -55,10 +55,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("smm-bot")
 
-# Черновики задач, ожидающие выбора приоритета/срока (draft_id -> данные)
-drafts: dict[str, dict] = {}
-# Сборка альбомов (media_group_id -> данные)
-media_groups: dict[str, dict] = {}
+# Активные черновики (chat_id -> данные). Один черновик на чат.
+# Структура: {texts:[], files:[(file_id,filename)], sender, panel_msg_id,
+#             priority, due, seen_media_groups:set, debounce_task}
+drafts: dict[int, dict] = {}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -114,33 +114,38 @@ async def attach_file(client, task_gid, filepath, filename):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Разбор сообщения и сборка описания
+#  Сборка названия / описания из накопленных текстов
 # ─────────────────────────────────────────────────────────────
-def parse_message(text):
-    """(название, тело_без_ссылок, список_ссылок)."""
-    text = (text or "").strip()
-    links = URL_RE.findall(text)
-    if not text:
+def assemble(texts):
+    """Возвращает (название, тело_без_ссылок, список_ссылок) из всех сообщений."""
+    full = "\n".join(t for t in texts if t and t.strip()).strip()
+    links = URL_RE.findall(full)
+    if not full:
         return "Задача из Telegram", "", links
 
-    # Убираем ссылки из тела, чтобы не дублировались (они уйдут в блок сверху)
-    body_text = URL_RE.sub("", text).strip()
+    body_text = URL_RE.sub("", full).strip()
     lines = body_text.split("\n")
     title = "Задача из Telegram"
-    rest_lines = []
+    rest = []
     title_taken = False
     for l in lines:
         if not title_taken and l.strip():
             title = l.strip()[:120]
             title_taken = True
         elif title_taken:
-            rest_lines.append(l)
-    body = "\n".join(rest_lines).strip()
-    return title, body, links
+            rest.append(l)
+    body = "\n".join(rest).strip()
+    # уникализируем ссылки, сохраняя порядок
+    seen = set()
+    uniq_links = []
+    for u in links:
+        if u not in seen:
+            seen.add(u)
+            uniq_links.append(u)
+    return title, body, uniq_links
 
 
 def build_notes(body, links, priority_key, due_label, sender):
-    """Описание с блоком-шапкой сверху."""
     head = []
     if links:
         head.append("🔗 Ссылка: " + "  ".join(links))
@@ -160,33 +165,39 @@ def build_notes(body, links, priority_key, due_label, sender):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Кнопки выбора приоритета / срока
+#  Клавиатуры
 # ─────────────────────────────────────────────────────────────
-def priority_keyboard(draft_id):
+def collect_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Собрать задачу", callback_data="collect")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+    ])
+
+
+def priority_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔴 Высокий", callback_data=f"p|{draft_id}|high"),
-            InlineKeyboardButton("🟡 Средний", callback_data=f"p|{draft_id}|medium"),
-            InlineKeyboardButton("🟢 Низкий", callback_data=f"p|{draft_id}|low"),
+            InlineKeyboardButton("🔴 Высокий", callback_data="p|high"),
+            InlineKeyboardButton("🟡 Средний", callback_data="p|medium"),
+            InlineKeyboardButton("🟢 Низкий", callback_data="p|low"),
         ],
     ])
 
 
-def due_keyboard(draft_id):
+def due_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("Сегодня", callback_data=f"d|{draft_id}|today"),
-            InlineKeyboardButton("Завтра", callback_data=f"d|{draft_id}|tomorrow"),
+            InlineKeyboardButton("Сегодня", callback_data="d|today"),
+            InlineKeyboardButton("Завтра", callback_data="d|tomorrow"),
         ],
         [
-            InlineKeyboardButton("Через неделю", callback_data=f"d|{draft_id}|week"),
-            InlineKeyboardButton("Без срока", callback_data=f"d|{draft_id}|none"),
+            InlineKeyboardButton("Через неделю", callback_data="d|week"),
+            InlineKeyboardButton("Без срока", callback_data="d|none"),
         ],
     ])
 
 
 def resolve_due(key):
-    """-> (date_iso | None, человекочитаемый_лейбл | None)."""
     today = date.today()
     if key == "today":
         d = today
@@ -200,16 +211,79 @@ def resolve_due(key):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Финальное создание задачи (после выбора кнопок)
+#  Панель-черновик: показать / обновить сводку накопленного
 # ─────────────────────────────────────────────────────────────
-async def finalize_task(context, chat_id, status_msg_id, draft):
+def draft_summary(draft):
+    title, body, links = assemble(draft["texts"])
+    n_files = len(draft["files"])
+    lines = [f"📝 Черновик: «{title}»"]
+    extras = []
+    if body:
+        extras.append("текст ✚")
+    if links:
+        extras.append(f"ссылок: {len(links)}")
+    if n_files:
+        extras.append(f"вложений: {n_files}")
+    if extras:
+        lines.append("Собрано: " + ", ".join(extras))
+    lines.append("\nКидай ещё или жми «Собрать задачу», когда всё.")
+    return "\n".join(lines)
+
+
+async def refresh_panel(context, chat_id):
+    """Обновляет (или создаёт) сообщение-панель с кнопками."""
+    draft = drafts.get(chat_id)
+    if not draft:
+        return
+    text = draft_summary(draft)
+    if draft.get("panel_msg_id"):
+        try:
+            await context.bot.edit_message_text(
+                text, chat_id, draft["panel_msg_id"],
+                reply_markup=collect_keyboard(),
+            )
+            return
+        except Exception:
+            pass  # сообщение могло устареть — пересоздадим ниже
+    msg = await context.bot.send_message(
+        chat_id, text, reply_markup=collect_keyboard()
+    )
+    draft["panel_msg_id"] = msg.message_id
+
+
+# Дебаунс: при пачке сообщений (особенно альбомов) обновляем панель один раз.
+async def schedule_refresh(context, chat_id):
+    draft = drafts.get(chat_id)
+    if not draft:
+        return
+    old = draft.get("debounce_task")
+    if old and not old.done():
+        old.cancel()
+
+    async def _later():
+        try:
+            await asyncio.sleep(1.0)
+            await refresh_panel(context, chat_id)
+        except asyncio.CancelledError:
+            pass
+
+    draft["debounce_task"] = context.application.create_task(_later())
+
+
+# ─────────────────────────────────────────────────────────────
+#  Финальное создание задачи
+# ─────────────────────────────────────────────────────────────
+async def finalize_task(context, chat_id):
+    draft = drafts.get(chat_id)
+    if not draft:
+        return
     bot = context.bot
     priority_key = draft.get("priority")
-    due_key = draft.get("due")
-    due_iso, due_label = resolve_due(due_key) if due_key else (None, None)
+    due_iso, due_label = resolve_due(draft["due"]) if draft.get("due") else (None, None)
 
-    title, body, links = parse_message(draft["caption"])
+    title, body, links = assemble(draft["texts"])
     notes = build_notes(body, links, priority_key, due_label, draft["sender"])
+    panel_id = draft["panel_msg_id"]
 
     async with httpx.AsyncClient() as client:
         try:
@@ -218,9 +292,8 @@ async def finalize_task(context, chat_id, status_msg_id, draft):
             await move_task_to_section(client, task_gid)
         except Exception as e:
             log.exception("Ошибка создания задачи")
-            await bot.edit_message_text(
-                f"❌ Не смог создать задачу:\n{e}", chat_id, status_msg_id
-            )
+            await bot.edit_message_text(f"❌ Не смог создать задачу:\n{e}", chat_id, panel_id)
+            drafts.pop(chat_id, None)
             return
 
         attached = 0
@@ -237,51 +310,17 @@ async def finalize_task(context, chat_id, status_msg_id, draft):
                 log.warning("Не прикрепил файл %s: %s", filename, e)
 
     permalink = task.get("permalink_url", "")
-    lines = [f"✅ Задача создана: {title}"]
+    out = [f"✅ Задача создана: {title}"]
     if priority_key:
-        lines.append(f"🚩 {PRIORITY_LABELS[priority_key]}")
+        out.append(f"🚩 {PRIORITY_LABELS[priority_key]}")
     if due_label:
-        lines.append(f"📅 {due_label}")
+        out.append(f"📅 {due_label}")
     if attached:
-        lines.append(f"📎 Вложений: {attached}")
+        out.append(f"📎 Вложений: {attached}")
     if permalink:
-        lines.append(permalink)
-    await bot.edit_message_text("\n".join(lines), chat_id, status_msg_id)
-
-
-# ─────────────────────────────────────────────────────────────
-#  Создание черновика и показ кнопок приоритета
-# ─────────────────────────────────────────────────────────────
-async def start_draft(context, chat_id, sender, caption, files):
-    draft_id = f"{chat_id}_{int(asyncio.get_event_loop().time()*1000)}"
-    drafts[draft_id] = {
-        "chat_id": chat_id,
-        "sender": sender,
-        "caption": caption,
-        "files": files,
-        "priority": None,
-        "due": None,
-    }
-    title, _, _ = parse_message(caption)
-    msg = await context.bot.send_message(
-        chat_id,
-        f"📝 «{title}»\n\nВыбери приоритет:",
-        reply_markup=priority_keyboard(draft_id),
-    )
-    drafts[draft_id]["status_msg_id"] = msg.message_id
-
-
-# ─────────────────────────────────────────────────────────────
-#  Сборка альбома (media group) с задержкой
-# ─────────────────────────────────────────────────────────────
-async def flush_media_group(context, group_id):
-    await asyncio.sleep(2)
-    data = media_groups.pop(group_id, None)
-    if not data:
-        return
-    await start_draft(
-        context, data["chat_id"], data["sender"], data["caption"], data["files"]
-    )
+        out.append(permalink)
+    await bot.edit_message_text("\n".join(out), chat_id, panel_id)
+    drafts.pop(chat_id, None)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -296,14 +335,22 @@ def authorized(update: Update) -> bool:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else "?"
     await update.message.reply_text(
-        "Привет! Кидай сюда задачу для СММ-щика.\n\n"
-        "• Первая строка — название задачи\n"
-        "• Остальное — описание\n"
-        "• Ссылку добавлю отдельным блоком сверху\n"
-        "• Можно приложить фото/видео (в т.ч. альбомом)\n\n"
-        "После отправки выберешь приоритет и срок кнопками.\n\n"
+        "Привет! Кидай материал для задачи — можно несколькими сообщениями подряд "
+        "(текст, фото, видео, ссылки, в т.ч. пересланные).\n\n"
+        "Бот копит всё в один черновик. Когда всё скинул — жми «✅ Собрать задачу», "
+        "выбери приоритет и срок.\n\n"
+        "• Первая строка текста — название задачи\n"
+        "• Ссылки соберу отдельным блоком сверху\n"
+        "• /cancel — сбросить текущий черновик\n\n"
         f"Твой Telegram ID: {uid}"
     )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if drafts.pop(update.effective_chat.id, None):
+        await update.message.reply_text("🗑 Черновик сброшен.")
+    else:
+        await update.message.reply_text("Нет активного черновика.")
 
 
 def file_from_message(msg):
@@ -324,58 +371,97 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = update.message
+    chat_id = msg.chat_id
     sender = update.effective_user.full_name if update.effective_user else "—"
-    await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
-    file_tuple = file_from_message(msg)
 
-    if msg.media_group_id:
-        gid = msg.media_group_id
-        grp = media_groups.get(gid)
-        if not grp:
-            grp = {"chat_id": msg.chat_id, "sender": sender,
-                   "caption": msg.caption or "", "files": []}
-            media_groups[gid] = grp
-            context.application.create_task(flush_media_group(context, gid))
-        if msg.caption:
-            grp["caption"] = msg.caption
-        if file_tuple:
-            grp["files"].append(file_tuple)
+    # Создаём черновик, если его ещё нет
+    draft = drafts.get(chat_id)
+    if not draft:
+        draft = {
+            "texts": [],
+            "files": [],
+            "sender": sender,
+            "panel_msg_id": None,
+            "priority": None,
+            "due": None,
+            "seen_media_groups": set(),
+            "debounce_task": None,
+            "stage": "collecting",
+        }
+        drafts[chat_id] = draft
+
+    # Если черновик уже на этапе выбора приоритета/срока — не примешиваем новые
+    if draft.get("stage") != "collecting":
+        await msg.reply_text(
+            "⏳ Этот черновик уже собирается (выбери приоритет/срок выше). "
+            "Для новой задачи заверши текущую или /cancel."
+        )
         return
 
-    caption = msg.text or msg.caption or ""
-    files = [file_tuple] if file_tuple else []
-    await start_draft(context, msg.chat_id, sender, caption, files)
+    # Текст / подпись
+    text = msg.text or msg.caption
+    if text:
+        draft["texts"].append(text)
+
+    # Файл
+    file_tuple = file_from_message(msg)
+    if file_tuple:
+        draft["files"].append(file_tuple)
+
+    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    await schedule_refresh(context, chat_id)
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    parts = query.data.split("|")
-    kind, draft_id, value = parts[0], parts[1], parts[2]
+    chat_id = query.message.chat_id
+    data = query.data
+    draft = drafts.get(chat_id)
 
-    draft = drafts.get(draft_id)
     if not draft:
-        await query.edit_message_text("⌛ Черновик устарел, отправь задачу заново.")
+        await query.edit_message_text("⌛ Черновик устарел. Кидай материал заново.")
         return
 
-    title, _, _ = parse_message(draft["caption"])
+    if data == "cancel":
+        drafts.pop(chat_id, None)
+        await query.edit_message_text("🗑 Черновик отменён.")
+        return
 
-    if kind == "p":
-        draft["priority"] = value
+    if data == "collect":
+        if not draft["texts"] and not draft["files"]:
+            await query.answer("Черновик пуст — кинь хоть что-то", show_alert=True)
+            return
+        draft["stage"] = "priority"
+        title, _, _ = assemble(draft["texts"])
         await query.edit_message_text(
-            f"📝 «{title}»\n🚩 Приоритет: {PRIORITY_LABELS[value]}\n\nТеперь выбери срок:",
-            reply_markup=due_keyboard(draft_id),
+            f"📝 «{title}»\n\nВыбери приоритет:",
+            reply_markup=priority_keyboard(),
         )
-    elif kind == "d":
-        draft["due"] = value
+        return
+
+    if data.startswith("p|"):
+        draft["priority"] = data.split("|")[1]
+        draft["stage"] = "due"
+        title, _, _ = assemble(draft["texts"])
+        await query.edit_message_text(
+            f"📝 «{title}»\n🚩 Приоритет: {PRIORITY_LABELS[draft['priority']]}\n\nТеперь срок:",
+            reply_markup=due_keyboard(),
+        )
+        return
+
+    if data.startswith("d|"):
+        draft["due"] = data.split("|")[1]
+        title, _, _ = assemble(draft["texts"])
         await query.edit_message_text(f"📝 «{title}»\n⏳ Создаю задачу…")
-        await finalize_task(context, draft["chat_id"], draft["status_msg_id"], draft)
-        drafts.pop(draft_id, None)
+        await finalize_task(context, chat_id)
+        return
 
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(
         MessageHandler(
