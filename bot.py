@@ -430,6 +430,10 @@ def is_allowed(user_id):
     return user_id is not None and user_id in ALLOWED_USERS
 
 
+def is_admin(user_id):
+    return ADMIN_ID is not None and user_id == ADMIN_ID
+
+
 async def notify_admin_request(context, user, chat_id, text_preview):
     if ADMIN_ID is None or user is None or user.id in _notified_strangers:
         return
@@ -482,18 +486,33 @@ def restricted(handler):
 # ─────────────────────────────────────────────────────────────
 @restricted
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id if update.effective_user else "?"
+    uid = update.effective_user.id if update.effective_user else None
     chat_id = update.effective_chat.id
-    await update.message.reply_text(
-        "Привет! Кидай материал задачи на пост — можно несколькими сообщениями "
-        "(текст, афиша, ссылки, файлы). Жми «✅ Создать задачу», выбери приоритет и дату.\n\n"
-        "Дальше задача идёт по воркфлоу: СММ берёт в работу → публикует → "
-        "присылает ссылку → ты проверяешь (правки/одобрить) → Done.\n\n"
-        "• /digest — список активных задач\n"
-        "• /setsmm — назначить этот чат получателем уведомлений СММ\n"
-        "• /cancel — сбросить черновик\n\n"
-        f"Твой Telegram ID / chat_id: {uid} / {chat_id}"
-    )
+
+    if is_admin(uid):
+        # Текст для тебя (админа)
+        await update.message.reply_text(
+            "Привет! Кидай материал задачи на пост — можно несколькими сообщениями "
+            "(текст, афиша, ссылки, файлы). Жми «✅ Создать задачу», выбери приоритет и дату.\n\n"
+            "Дальше задача идёт по воркфлоу: СММ берёт в работу → публикует → "
+            "присылает ссылку → ты проверяешь (правки/одобрить) → Done.\n\n"
+            "• /digest — список активных задач\n"
+            "• /setsmm — назначить этот чат получателем уведомлений СММ\n"
+            "• /cancel — сбросить черновик\n\n"
+            f"Твой Telegram ID / chat_id: {uid} / {chat_id}"
+        )
+    else:
+        # Текст для СММ (разрешённый пользователь, но не админ)
+        await update.message.reply_text(
+            "Привет! Я бот для задач на пост. 🎬\n\n"
+            "Как работаем:\n"
+            "1. Тебе приходит новая задача с кнопкой «🤝 Взять в работу» — жми, когда берёшься.\n"
+            "2. Публикуешь пост и присылаешь мне сюда ссылку на Instagram — я передам на проверку.\n"
+            "3. Если будут правки — пришлю их сюда, смотри в Асане. Если всё ок — задача закроется.\n\n"
+            "• /digest — показать твои активные задачи\n"
+            "• Под каждой задачей есть «📎 Прислать файлы» — выгружу афишу/видео из Асаны сюда.\n\n"
+            "Чтобы получать ежедневный список задач — напиши /setsmm один раз."
+        )
 
 
 @restricted
@@ -507,10 +526,19 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_setsmm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global runtime_smm_chat_id
     runtime_smm_chat_id = update.effective_chat.id
-    await update.message.reply_text(
-        f"✅ Этот чат назначен получателем уведомлений СММ. chat_id: {runtime_smm_chat_id}\n"
-        "Впиши его в Railway → SMM_CHAT_ID, чтобы сохранилось после рестарта."
-    )
+    uid = update.effective_user.id if update.effective_user else None
+    if is_admin(uid):
+        # тебе — техническая инструкция
+        await update.message.reply_text(
+            f"✅ Этот чат назначен получателем уведомлений СММ. chat_id: {runtime_smm_chat_id}\n"
+            "Впиши его в Railway → SMM_CHAT_ID, чтобы сохранилось после рестарта."
+        )
+    else:
+        # СММ — понятный текст без технических деталей
+        await update.message.reply_text(
+            "✅ Готово! Теперь ты будешь получать сюда список задач на день "
+            "и уведомления о новых постах. Можешь приступать к работе 🙌"
+        )
 
 
 @restricted
@@ -704,8 +732,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await finalize_task(context, chat_id)
         return
 
+    # Если задача уже на стадии выбора приоритета/даты, но ещё НЕ создана —
+    # всё равно принимаем доп. текст/файлы (вдруг фото пришло чуть позже).
+    if draft.get("stage") in ("priority", "date"):
+        text = msg.text or msg.caption
+        added = []
+        if text:
+            draft["texts"].append(text); added.append("текст")
+        ft = file_from_message(msg)
+        if ft:
+            draft["files"].append(ft); added.append("файл")
+        if added:
+            await msg.reply_text(
+                f"➕ Добавил ({', '.join(added)}) к задаче. "
+                f"Всего вложений: {len(draft['files'])}. Продолжай выбор выше 👆"
+            )
+        return
+
     if draft.get("stage") != "collecting":
-        await msg.reply_text("⏳ Задача уже собирается (выбери приоритет/дату выше) или /cancel.")
+        await msg.reply_text("⏳ Задача уже создаётся. Подожди или /cancel.")
         return
 
     text = msg.text or msg.caption
@@ -751,7 +796,7 @@ async def finalize_edit(context, admin_chat, w):
     task_gid = w["task_gid"]
     texts = w.get("texts", [])
     files = w.get("files", [])
-    comment = "✏️ Есть правка по задаче:\n" + ("\n".join(texts) if texts else "(см. вложения)")
+    comment = "✏️ Правка от заказчика:\n" + ("\n".join(texts) if texts else "(см. вложения)")
     async with httpx.AsyncClient() as client:
         try:
             await add_comment(client, task_gid, comment)
