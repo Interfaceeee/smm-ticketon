@@ -959,13 +959,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 await query.edit_message_text(f"⚠️ Ошибка: {e}")
                 return
-        await query.edit_message_text(
-            f"🤝 Взято в работу: {t['name']}\n\n"
-            "Когда опубликуешь — пришли сюда ссылку на пост (Instagram)."
-        )
+        lines = [f"🤝 Взято в работу: {t['name']}"]
+        if t.get("permalink_url"):
+            lines.append(f"🗂 Асана: {t['permalink_url']}")
+        lines.append("\nКогда опубликуешь — пришли сюда ссылку на пост (Instagram).")
+        await query.edit_message_text("\n".join(lines), disable_web_page_preview=True)
         waiting[chat_id] = {"mode": "await_post_link", "task_gid": task_gid}
         if ADMIN_ID:
-            await context.bot.send_message(ADMIN_ID, f"🤝 СММ взял(а) в работу: {t['name']}")
+            admin_line = f"🤝 СММ взял(а) в работу: {t['name']}"
+            await context.bot.send_message(ADMIN_ID, admin_line)
         return
 
     if data.startswith("link|"):
@@ -977,10 +979,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer(f"Ошибка: {e}", show_alert=True)
                 return
         waiting[chat_id] = {"mode": "await_post_link", "task_gid": task_gid}
-        await context.bot.send_message(
-            chat_id,
-            f"🔗 Пришли ссылку на пост (Instagram) для задачи:\n📌 {t['name']}"
-        )
+        lines = [f"🔗 Пришли ссылку на пост (Instagram) для задачи:", f"📌 {t['name']}"]
+        if t.get("permalink_url"):
+            lines.append(f"🗂 Асана: {t['permalink_url']}")
+        await context.bot.send_message(chat_id, "\n".join(lines), disable_web_page_preview=True)
         return
 
     if data.startswith("edit|"):
