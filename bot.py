@@ -3,6 +3,7 @@ import re
 import logging
 import asyncio
 import tempfile
+import functools
 from datetime import date, timedelta, time
 from zoneinfo import ZoneInfo
 
@@ -44,10 +45,13 @@ PRIORITY_OPTIONS = {
 }
 PRIORITY_LABELS = {"high": "Высокий", "medium": "Средний", "low": "Низкий"}
 
-# Кто может слать события (Telegram user id через запятую). Пусто = все.
-ALLOWED_USERS = {
-    int(x) for x in os.environ.get("ALLOWED_USERS", "").split(",") if x.strip()
-}
+# Единый белый список: кто может пользоваться ботом (id через запятую).
+# Применяется ко ВСЕМ командам, сообщениям и кнопкам. Чужие игнорируются.
+# Если список пуст и переменная не задана — бот предупреждает в логах и
+# работает в открытом режиме (для первичной настройки). Как только впишешь
+# хотя бы один id — доступ только у перечисленных.
+_RAW_ALLOWED = os.environ.get("ALLOWED_USERS", "").strip()
+ALLOWED_USERS = {int(x) for x in _RAW_ALLOWED.split(",") if x.strip()}
 # Chat id СММщицы для дайджеста (узнаётся по /start, впиши в Railway для надёжности)
 SMM_CHAT_ID = os.environ.get("SMM_CHAT_ID", "").strip()
 
@@ -443,22 +447,45 @@ async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────
 #  Хендлеры
 # ─────────────────────────────────────────────────────────────
-def authorized(update: Update) -> bool:
+# ─────────────────────────────────────────────────────────────
+#  Хендлеры
+# ─────────────────────────────────────────────────────────────
+def is_allowed(user_id: int | None) -> bool:
+    """True, если пользователю можно пользоваться ботом."""
     if not ALLOWED_USERS:
+        # Список не настроен — открытый режим (только для первичной настройки).
         return True
-    return update.effective_user and update.effective_user.id in ALLOWED_USERS
+    return user_id is not None and user_id in ALLOWED_USERS
 
 
+def restricted(handler):
+    """Декоратор: пропускает только пользователей из ALLOWED_USERS.
+    Чужих игнорирует молча (для callback-кнопок гасит «часики»)."""
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        uid = user.id if user else None
+        if not is_allowed(uid):
+            log.info("Отклонён доступ: user_id=%s username=%s",
+                     uid, getattr(user, "username", None))
+            # Если это нажатие кнопки — обязательно ответить на callback,
+            # иначе у пользователя «висит» индикатор загрузки.
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer(
+                        "Нет доступа к этому боту.", show_alert=True
+                    )
+                except Exception:
+                    pass
+            return
+        return await handler(update, context)
+    return wrapper
+
+
+@restricted
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global runtime_smm_chat_id
     uid = update.effective_user.id if update.effective_user else "?"
     chat_id = update.effective_chat.id
-    # Любой, кто не входит в ALLOWED_USERS, считается потенциальным получателем
-    # дайджеста (т.е. СММщица). Если список пуст — не назначаем автоматически.
-    note = ""
-    if ALLOWED_USERS and uid not in ALLOWED_USERS and runtime_smm_chat_id is None:
-        runtime_smm_chat_id = chat_id
-        note = "\n\n✅ Ты зарегистрирована как получатель ежедневного дайджеста в 10:00."
     await update.message.reply_text(
         "Привет! Кидай материал для события — можно несколькими сообщениями подряд "
         "(текст, афиша, ссылки на сайт и пост, в т.ч. пересланные).\n\n"
@@ -467,11 +494,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Первая строка текста — название события\n"
         "• Ссылку ticketon → сайт, instagram → пост (бот сам разложит)\n"
         "• /digest — прислать дайджест прямо сейчас\n"
+        "• /setsmm — назначить этот чат получателем ежедневного дайджеста\n"
         "• /cancel — сбросить черновик\n\n"
-        f"Твой Telegram ID / chat_id: {uid} / {chat_id}" + note
+        f"Твой Telegram ID / chat_id: {uid} / {chat_id}"
     )
 
 
+@restricted
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if drafts.pop(update.effective_chat.id, None):
         await update.message.reply_text("🗑 Черновик сброшен.")
@@ -479,12 +508,14 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет активного черновика.")
 
 
+@restricted
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await build_and_send_digest(context, target_chat=update.effective_chat.id)
 
 
+@restricted
 async def cmd_setsmm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Назначить текущий чат получателем дайджеста (для самой СММщицы)."""
+    """Назначить текущий чат получателем дайджеста."""
     global runtime_smm_chat_id
     runtime_smm_chat_id = update.effective_chat.id
     await update.message.reply_text(
@@ -505,11 +536,8 @@ def file_from_message(msg):
     return None
 
 
+@restricted
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update):
-        await update.message.reply_text("⛔ Нет доступа к созданию событий.")
-        return
-
     msg = update.message
     chat_id = msg.chat_id
     sender = update.effective_user.full_name if update.effective_user else "—"
@@ -565,6 +593,7 @@ def parse_manual_date(text):
     return None
 
 
+@restricted
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
