@@ -751,7 +751,7 @@ async def finalize_edit(context, admin_chat, w):
     task_gid = w["task_gid"]
     texts = w.get("texts", [])
     files = w.get("files", [])
-    comment = "✏️ Правка от менеджера:\n" + ("\n".join(texts) if texts else "(см. вложения)")
+    comment = "✏️ Есть правка по задаче:\n" + ("\n".join(texts) if texts else "(см. вложения)")
     async with httpx.AsyncClient() as client:
         try:
             await add_comment(client, task_gid, comment)
