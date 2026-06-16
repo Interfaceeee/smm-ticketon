@@ -1,2 +1,4 @@
 python-telegram-bot[job-queue]==22.8
 httpx==0.28.1
+APScheduler==3.11.2
+pytz==2025.2
