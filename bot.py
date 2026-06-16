@@ -54,6 +54,14 @@ _RAW_ALLOWED = os.environ.get("ALLOWED_USERS", "").strip()
 ALLOWED_USERS = {int(x) for x in _RAW_ALLOWED.split(",") if x.strip()}
 # Chat id СММщицы для дайджеста (узнаётся по /start, впиши в Railway для надёжности)
 SMM_CHAT_ID = os.environ.get("SMM_CHAT_ID", "").strip()
+# Админ — кому бот шлёт уведомления о запросах доступа от чужих (обычно твой id).
+# Если не задан, берётся первый из ALLOWED_USERS.
+_RAW_ADMIN = os.environ.get("ADMIN_ID", "").strip()
+ADMIN_ID = int(_RAW_ADMIN) if _RAW_ADMIN else (
+    min(ALLOWED_USERS) if ALLOWED_USERS else None
+)
+# Чтобы не спамить тебя — не уведомляем повторно об одном и том же чужом id
+_notified_strangers: set[int] = set()
 
 TZ = ZoneInfo("Asia/Bishkek")
 ASANA_API = "https://app.asana.com/api/1.0"
@@ -145,6 +153,17 @@ async def complete_task(client, task_gid):
         json={"data": {"completed": True}},
         headers=asana_headers(), timeout=30,
     )
+
+
+async def list_attachments(client, task_gid):
+    """Список вложений задачи с временными download_url."""
+    params = {"opt_fields": "name,download_url,resource_subtype,host"}
+    r = await client.get(
+        f"{ASANA_API}/tasks/{task_gid}/attachments",
+        params=params, headers=asana_headers(), timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -419,24 +438,34 @@ async def build_and_send_digest(context: ContextTypes.DEFAULT_TYPE, target_chat=
         await context.bot.send_message(chat, text)
         return "empty"
 
-    lines = [f"📅 События для сторис на {today.strftime('%d.%m.%Y')}:\n"]
+    # Заголовок отдельным сообщением
+    header = f"📅 События для сторис на {today.strftime('%d.%m.%Y')} — {len(active)} шт."
+    await context.bot.send_message(chat, header)
+
+    # Каждое событие — отдельным сообщением со ссылкой на Асану и кнопкой файлов
     for t in active:
         due = t.get("due_on")
-        when = date.fromisoformat(due).strftime("%d.%m") if due else "—"
-        block = [f"• {t['name']} ({when})"]
+        when = date.fromisoformat(due).strftime("%d.%m.%Y") if due else "дата не указана"
+        block = [f"📌 {t['name']}", f"📅 {when}"]
         site, post, _ = classify_links(URL_RE.findall(t.get("notes") or ""))
         if site:
-            block.append(f"  🌐 {site}")
+            block.append(f"🌐 Сайт: {site}")
         if post:
-            block.append(f"  📸 {post}")
-        lines.append("\n".join(block))
-    if archived:
-        lines.append(f"\n🗂 Заархивировано прошедших: {archived}")
+            block.append(f"📸 Пост: {post}")
+        permalink = t.get("permalink_url")
+        if permalink:
+            block.append(f"🗂 Асана: {permalink}")
 
-    # Telegram лимит ~4096 символов — режем при необходимости
-    full = "\n".join(lines)
-    for chunk_start in range(0, len(full), 3900):
-        await context.bot.send_message(chat, full[chunk_start:chunk_start + 3900])
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📎 Прислать файлы", callback_data=f"files|{t['gid']}")
+        ]])
+        await context.bot.send_message(
+            chat, "\n".join(block), reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+
+    if archived:
+        await context.bot.send_message(chat, f"🗂 Заархивировано прошедших: {archived}")
     return "ok"
 
 
@@ -444,9 +473,66 @@ async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE):
     await build_and_send_digest(context)
 
 
-# ─────────────────────────────────────────────────────────────
-#  Хендлеры
-# ─────────────────────────────────────────────────────────────
+# Telegram Bot API лимиты: фото ~10 МБ, документ/видео ~50 МБ
+TG_PHOTO_LIMIT = 10 * 1024 * 1024
+TG_FILE_LIMIT = 50 * 1024 * 1024
+IMG_EXT = (".jpg", ".jpeg", ".png", ".webp")
+VID_EXT = (".mp4", ".mov", ".m4v")
+
+
+async def send_event_files(context, chat_id, task_gid, query=None):
+    """Качает вложения задачи из Асаны и шлёт их в чат."""
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        try:
+            atts = await list_attachments(client, task_gid)
+        except Exception as e:
+            log.exception("Файлы: ошибка чтения вложений")
+            await context.bot.send_message(chat_id, f"⚠️ Не смог получить вложения: {e}")
+            return
+
+        if not atts:
+            await context.bot.send_message(chat_id, "📭 У этого события нет прикреплённых файлов.")
+            return
+
+        await context.bot.send_message(chat_id, f"📎 Отправляю файлы ({len(atts)} шт.)…")
+        sent, skipped = 0, []
+        for a in atts:
+            name = a.get("name") or "file"
+            url = a.get("download_url")
+            if not url:
+                # Вложение-ссылка (например, на внешний сервис) — шлём ссылкой
+                skipped.append(name)
+                continue
+            try:
+                resp = await client.get(url, timeout=120)
+                resp.raise_for_status()
+                content = resp.content
+                size = len(content)
+                low = name.lower()
+
+                if low.endswith(IMG_EXT) and size <= TG_PHOTO_LIMIT:
+                    await context.bot.send_photo(chat_id, photo=content, caption=name)
+                elif low.endswith(VID_EXT) and size <= TG_FILE_LIMIT:
+                    await context.bot.send_video(chat_id, video=content, caption=name)
+                elif size <= TG_FILE_LIMIT:
+                    await context.bot.send_document(chat_id, document=content, filename=name)
+                else:
+                    skipped.append(f"{name} (слишком большой)")
+                    continue
+                sent += 1
+            except Exception as e:
+                log.warning("Не отправил вложение %s: %s", name, e)
+                skipped.append(name)
+
+        if sent:
+            await context.bot.send_message(chat_id, f"✅ Отправлено: {sent}")
+        if skipped:
+            await context.bot.send_message(
+                chat_id,
+                "⚠️ Не удалось отправить (открой в Асане):\n" + "\n".join(f"• {s}" for s in skipped),
+            )
+
+
 # ─────────────────────────────────────────────────────────────
 #  Хендлеры
 # ─────────────────────────────────────────────────────────────
@@ -458,9 +544,41 @@ def is_allowed(user_id: int | None) -> bool:
     return user_id is not None and user_id in ALLOWED_USERS
 
 
+async def notify_admin_request(context, user, chat_id, text_preview):
+    """Шлёт админу карточку с данными чужого пользователя (один раз на id)."""
+    if ADMIN_ID is None or user is None:
+        return
+    if user.id in _notified_strangers:
+        return
+    _notified_strangers.add(user.id)
+
+    uname = f"@{user.username}" if user.username else "—"
+    name = user.full_name or "—"
+    preview = (text_preview or "").strip()
+    if len(preview) > 200:
+        preview = preview[:200] + "…"
+    msg = (
+        "🔔 Запрос доступа к боту\n\n"
+        f"👤 Имя: {name}\n"
+        f"🔗 Username: {uname}\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"💬 chat_id: `{chat_id}`\n"
+    )
+    if preview:
+        msg += f"\n📝 Написал(а): {preview}\n"
+    msg += (
+        "\nЧтобы дать доступ — добавь этот ID в Railway → ALLOWED_USERS "
+        "(через запятую к остальным) и сохрани."
+    )
+    try:
+        await context.bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
+    except Exception as e:
+        log.warning("Не смог уведомить админа: %s", e)
+
+
 def restricted(handler):
     """Декоратор: пропускает только пользователей из ALLOWED_USERS.
-    Чужих игнорирует молча (для callback-кнопок гасит «часики»)."""
+    Чужому отвечает его ID и уведомляет админа для одобрения."""
     @functools.wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -468,13 +586,28 @@ def restricted(handler):
         if not is_allowed(uid):
             log.info("Отклонён доступ: user_id=%s username=%s",
                      uid, getattr(user, "username", None))
-            # Если это нажатие кнопки — обязательно ответить на callback,
-            # иначе у пользователя «висит» индикатор загрузки.
+            chat_id = update.effective_chat.id if update.effective_chat else None
+            text_preview = update.message.text if (update.message and update.message.text) else ""
+
+            # Уведомляем админа (один раз на id)
+            await notify_admin_request(context, user, chat_id, text_preview)
+
+            # Отвечаем самому пользователю его ID
+            reply = (
+                "🔒 Доступ к этому боту ограничен.\n\n"
+                f"Твой ID: `{uid}`\n"
+                "Передай его администратору, чтобы он выдал доступ."
+            )
             if update.callback_query:
                 try:
                     await update.callback_query.answer(
-                        "Нет доступа к этому боту.", show_alert=True
+                        "Нет доступа. Запрос отправлен администратору.", show_alert=True
                     )
+                except Exception:
+                    pass
+            elif update.message:
+                try:
+                    await update.message.reply_text(reply, parse_mode="Markdown")
                 except Exception:
                     pass
             return
@@ -599,6 +732,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     chat_id = query.message.chat_id
     data = query.data
+
+    # Кнопка дайджеста «Прислать файлы» — не связана с черновиком
+    if data.startswith("files|"):
+        task_gid = data.split("|", 1)[1]
+        await send_event_files(context, chat_id, task_gid, query)
+        return
+
     draft = drafts.get(chat_id)
 
     if not draft:
