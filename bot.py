@@ -939,8 +939,18 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_startup(app: Application):
-    app.job_queue.run_daily(daily_digest_job, time=time(hour=10, minute=0, tzinfo=TZ), name="daily_digest")
-    log.info("Дайджест на 10:00 Asia/Bishkek")
+    # JobQueue требует extra [job-queue]. Если он не установлен (app.job_queue is None),
+    # не роняем бота — просто пропускаем планирование. Ручной /digest продолжит работать.
+    if app.job_queue is None:
+        log.warning("JobQueue недоступен — ежедневный дайджест по расписанию выключен. "
+                    "Установи зависимость python-telegram-bot[job-queue]. /digest работает.")
+        return
+    try:
+        app.job_queue.run_daily(daily_digest_job, time=time(hour=10, minute=0, tzinfo=TZ),
+                                name="daily_digest")
+        log.info("Дайджест на 10:00 Asia/Bishkek")
+    except Exception as e:
+        log.warning("Не удалось запланировать дайджест: %s", e)
 
 
 def main():
